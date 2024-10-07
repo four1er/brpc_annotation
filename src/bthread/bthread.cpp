@@ -172,9 +172,19 @@ static bool validate_bthread_concurrency_by_tag(const char*, int32_t val) {
 
 __thread TaskGroup* tls_task_group_nosignal = NULL;
 
+/**
+ * @brief create a new bthread from a non-bthread worker thread
+ *
+ * @param [in] tid
+ * @param [in] attr
+ * @param [in] fn
+ * @param [in] arg
+ * @return BUTIL_FORCE_INLINE
+ */
 BUTIL_FORCE_INLINE int start_from_non_worker(
     bthread_t* __restrict tid, const bthread_attr_t* __restrict attr,
     void* (*fn)(void*), void* __restrict arg) {
+  // TaskControl is a singleton, it manages all the task groups.
   TaskControl* c = get_or_new_task_control();
   if (NULL == c) {
     return ENOMEM;
@@ -188,6 +198,9 @@ BUTIL_FORCE_INLINE int start_from_non_worker(
     // 1. NOSIGNAL is often for creating many bthreads in batch,
     //    inserting into the same TaskGroup maximizes the batch.
     // 2. bthread_flush() needs to know which TaskGroup to flush.
+
+    // Obtain tls_task_group_nosignal, which is a thread local storage variable
+    // used to store the TaskGroup of the current thread.
     auto g = tls_task_group_nosignal;
     if (NULL == g) {
       g = c->choose_one_group(tag);
@@ -233,16 +246,34 @@ struct TidJoiner {
 
 extern "C" {
 
+/**
+ * @brief The current worker immediately executes a new bthread, and the current
+ * bthread is then scheduled later.
+ *
+ * @param [in] tid  The bthread id of the new bthread.
+ * @param [in] attr
+ * @param [in] fn   The function to be executed.
+ * @param [in] arg  The argument of the function.
+ * @return int
+ */
 int bthread_start_urgent(bthread_t* __restrict tid,
                          const bthread_attr_t* __restrict attr,
                          void* (*fn)(void*), void* __restrict arg) {
+  // tls_task_group is a thread local variable, it's default value is NULL. So
+  // if g is NULL, which means this is the first time to call this function in
+  // this thread, we need to create a new TaskGroup. And most importantly,
+  // current thread is not a bthread.
   bthread::TaskGroup* g = bthread::tls_task_group;
   if (g) {
     // if attribute is null use thread local task group
+    // From above, if g is not NULL, which means this thread is a bthread, and g
+    // is the TaskGroup of this bthread.
     if (bthread::can_run_thread_local(attr)) {
       return bthread::TaskGroup::start_foreground(&g, tid, attr, fn, arg);
     }
   }
+  // If g is NULL, current thread is not a bthread, so we need to create a new
+  // TaskGroup via bthread::start_from_non_worker.
   return bthread::start_from_non_worker(tid, attr, fn, arg);
 }
 
